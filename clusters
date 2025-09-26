@@ -1,0 +1,159 @@
+# ==== 1. Importar bibliotecas ====
+from google.cloud import bigquery
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+ 
+# Credenciais
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/content/authentic-bongo-469222-r5-1b6bea1978d0.json"
+ 
+# ==== 2. Conectar ao BigQuery ====
+client = bigquery.Client(project="authentic-bongo-469222-r5")
+ 
+# ==== 3. Buscar dados tratados ====
+query = """
+SELECT
+    ID_CLIENTE,
+    VL_TOTAL_CONTRATO,
+    QTD_CONTRATACOES_12M,
+    VLR_CONTRATACOES_12M,
+    HOSPEDAGEM,
+    DS_SEGMENTO
+FROM `authentic-bongo-469222-r5.diamante.clientes_historico_join`
+"""
+df = client.query(query).to_dataframe()
+ 
+# ==== 4. Agregar valores por cliente ====
+df_unique = df.groupby('ID_CLIENTE').agg({
+    'VL_TOTAL_CONTRATO': 'sum',
+    'QTD_CONTRATACOES_12M': 'sum',
+    'VLR_CONTRATACOES_12M': 'sum',
+    'HOSPEDAGEM': 'first',
+    'DS_SEGMENTO': 'first'
+}).reset_index()
+ 
+# ==== 5. One-Hot Encoding ====
+categoricas = ['HOSPEDAGEM', 'DS_SEGMENTO']
+df_encoded = pd.get_dummies(df_unique, columns=categoricas, drop_first=True)
+ 
+# ==== 6. Variáveis para clusterização ====
+vars_cluster = ['VL_TOTAL_CONTRATO','QTD_CONTRATACOES_12M','VLR_CONTRATACOES_12M'] \
+               + [col for col in df_encoded.columns if col.startswith(tuple(categoricas))]
+X = df_encoded[vars_cluster].copy()
+ 
+# ==== 7. Escalar dados ====
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+ 
+# ==== 8A. Seleção de número de clusters via BIC/AIC (GMM) ====
+n_components = range(1, 11)
+bics, aics = [], []
+ 
+for n in n_components:
+    gmm_tmp = GaussianMixture(n_components=n, covariance_type='full', random_state=42)
+    gmm_tmp.fit(X_scaled)
+    bics.append(gmm_tmp.bic(X_scaled))
+    aics.append(gmm_tmp.aic(X_scaled))
+ 
+plt.figure(figsize=(10,5))
+plt.plot(n_components, bics, marker='o', label='BIC')
+plt.plot(n_components, aics, marker='o', label='AIC')
+plt.xlabel("Número de Clusters")
+plt.ylabel("Score (menor é melhor)")
+plt.title("Seleção do número de clusters via BIC/AIC")
+plt.legend()
+plt.show()
+ 
+# ==== 8B. Método do Cotovelo (KMeans) ====
+inertias = []
+K = range(1, 11)
+ 
+for k in K:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    kmeans.fit(X_scaled)
+    inertias.append(kmeans.inertia_)
+ 
+plt.figure(figsize=(8,5))
+plt.plot(K, inertias, 'bo-', label="Inércia (KMeans)")
+plt.xlabel("Número de Clusters")
+plt.ylabel("Inércia")
+plt.title("Método do Cotovelo (KMeans)")
+plt.legend()
+plt.show()
+ 
+# ==== 9. Treinar modelo final GMM ====
+best_n = 5  # definir manualmente ou por np.argmin(bics)+1
+gmm = GaussianMixture(n_components=best_n, covariance_type='full', random_state=42)
+gmm.fit(X_scaled)
+ 
+labels = gmm.predict(X_scaled)
+probs = gmm.predict_proba(X_scaled)
+ 
+df_encoded['cluster'] = labels
+df_encoded['prob_max'] = probs.max(axis=1)
+ 
+# ==== 10. Visualização dos clusters ====
+# 10A. Scatter plot primeiras duas variáveis
+plt.figure(figsize=(8,6))
+sns.scatterplot(
+    x=X_scaled[:,0], y=X_scaled[:,1],
+    hue=df_encoded['cluster'],
+    palette="tab10", s=60
+)
+plt.xlabel(vars_cluster[0])
+plt.ylabel(vars_cluster[1])
+plt.title("Clusters (Primeiras 2 variáveis)")
+plt.legend(title="Cluster")
+plt.show()
+ 
+# 10B. Pairplot das primeiras 4 variáveis
+sns.pairplot(df_encoded, vars=vars_cluster[:4], hue="cluster", palette="tab10", diag_kind="kde")
+plt.suptitle("Distribuição dos clusters", y=1.02)
+plt.show()
+ 
+# 10C. PCA para redução dimensionalidade
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+ 
+plt.figure(figsize=(8,6))
+sns.scatterplot(
+    x=X_pca[:,0], y=X_pca[:,1],
+    hue=df_encoded['cluster'],
+    palette="tab10", s=60
+)
+plt.xlabel("PCA1")
+plt.ylabel("PCA2")
+plt.title("Clusters visualizados via PCA")
+plt.legend(title="Cluster")
+plt.show()
+ 
+# ==== 11. Análise resultado ====
+print("Distribuição de clientes por cluster:")
+print(df_encoded['cluster'].value_counts())
+print("\nPerfil médio dos clusters:")
+print(df_encoded.groupby('cluster')[vars_cluster].mean())
+ 
+# ==== 12. Preparar e salvar no BigQuery ====
+df_out = df_encoded[['ID_CLIENTE'] + vars_cluster].copy()
+df_out['cluster'] = labels.astype('int64')
+df_out['prob_max'] = probs.max(axis=1)
+ 
+# probabilidades de cada componente p0..p{best_n-1}
+for j in range(best_n):
+    df_out[f'p{j}'] = probs[:, j].astype('float64')
+ 
+# Configuração para sobrescrever a tabela e evitar erro de schema
+from google.cloud import bigquery
+job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+ 
+table_id = "authentic-bongo-469222-r5.diamante.TESTE4"
+job = client.load_table_from_dataframe(df_out, table_id, job_config=job_config)
+job.result()
+ 
+print(f"Tabela escrita: {table_id} | linhas: {len(df_out)}")
